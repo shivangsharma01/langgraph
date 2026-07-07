@@ -1537,14 +1537,15 @@ class SyncPregelLoop(PregelLoop, AbstractContextManager):
     ) -> RunnableConfig:
         if self._delta_write_futs:
             futs, self._delta_write_futs = self._delta_write_futs, []
-            concurrent.futures.wait(futs)
-        try:
-            if prev is not None:
-                prev.result()
-        finally:
-            cast(BaseCheckpointSaver, self.checkpointer).put(
-                config, checkpoint, metadata, new_versions
-            )
+            done, _ = concurrent.futures.wait(futs)
+            for fut in done:
+                fut.result()
+
+        if prev is not None:
+            prev.result()
+        cast(BaseCheckpointSaver, self.checkpointer).put(
+            config, checkpoint, metadata, new_versions
+        )
 
     def match_cached_writes(self) -> Sequence[PregelExecutableTask]:
         if self.cache is None:
@@ -1790,16 +1791,19 @@ class AsyncPregelLoop(PregelLoop, AbstractAsyncContextManager):
     ) -> RunnableConfig:
         # Drain DeltaChannel write futures before committing the checkpoint so
         # ancestor walks never see a checkpoint without its backing writes.
+        # gather() propagates the first write failure, preventing the
+        # checkpoint from being persisted when a write did not become durable.
         if self._delta_write_futs:
             futs, self._delta_write_futs = self._delta_write_futs, []
             await asyncio.gather(*futs)
-        try:
-            if prev is not None:
-                await prev
-        finally:
-            await cast(BaseCheckpointSaver, self.checkpointer).aput(
-                config, checkpoint, metadata, new_versions
-            )
+        # Wait for the previous checkpoint persistence. If it failed, do not
+        # commit this checkpoint: a later checkpoint must not become durable
+        # after an earlier one failed to persist.
+        if prev is not None:
+            await prev
+        await cast(BaseCheckpointSaver, self.checkpointer).aput(
+            config, checkpoint, metadata, new_versions
+        )
 
     async def amatch_cached_writes(self) -> Sequence[PregelExecutableTask]:
         if self.cache is None:
